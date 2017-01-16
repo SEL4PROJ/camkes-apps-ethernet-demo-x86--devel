@@ -31,6 +31,7 @@
 #include <ethdrivers/raw.h>
 #include <ethdrivers/lwip.h>
 #include <sel4utils/iommu_dma.h>
+#include <sel4utils/page_dma.h>
 #include <sel4platsupport/arch/io.h>
 #include <platsupport/timer.h>
 #include <platsupport/plat/hpet.h>
@@ -139,7 +140,7 @@ void hpet_irq_handle(void) {
 
 static lwip_iface_t *init_eth(int iospace_id, int bus, int dev, int fun) {
     int UNUSED error;
-    int pci_bdf = bus * 256 + dev * 8 + fun;
+    int UNUSED pci_bdf = bus * 256 + dev * 8 + fun;
     ps_io_ops_t ioops;
 
 #ifdef CONFIG_IOMMU
