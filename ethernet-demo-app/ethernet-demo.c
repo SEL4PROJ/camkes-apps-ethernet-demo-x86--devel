@@ -11,9 +11,12 @@
  */
 
 #include <camkes.h>
-#include <stdlib.h>
-
 #include <camkes/dma.h>
+
+/* remove the camkes ERR_IF definition to not overlap with lwip */
+#undef ERR_IF
+
+#include <stdlib.h>
 #include <stdio.h>
 
 #include <platsupport/io.h>
@@ -29,9 +32,14 @@
 #include <ethdrivers/lwip.h>
 #include <sel4utils/iommu_dma.h>
 #include <sel4platsupport/arch/io.h>
+#include <platsupport/timer.h>
+#include <platsupport/plat/hpet.h>
+#include <platsupport/arch/tsc.h>
 
 #include <lwip/init.h>
 #include <lwip/udp.h>
+#include <lwip/dhcp.h>
+#include <lwip/timers.h>
 #include <netif/etharp.h>
 
 #define RX_BUFS 256
@@ -45,14 +53,13 @@ static char allocator_mempool[0x4000];
 static lwip_iface_t _lwip;
 static seL4_CPtr (*original_vspace_get_cap)(vspace_t*, void*);
 static sel4utils_alloc_data_t vspace_data;
-
-static int num_rx_bufs = 0;
-static void *rx_bufs[RX_BUFS];
+static pstimer_t *hpet_timer = NULL;
+static pstimer_t *tsc_timer = NULL;
 
 void camkes_make_simple(simple_t *simple);
 
 static void init_env(void) {
-    int error;
+    int UNUSED error;
 
     camkes_make_simple(&camkes_simple);
 
@@ -114,17 +121,27 @@ static uintptr_t camkes_dma_pin(void *cookie, void *addr, size_t size) {
 #endif
 
 void eth_irq_handle(void) {
+    int UNUSED error;
+    error = lock_lock();
     ethif_lwip_handle_irq(&_lwip, 0);
-    int error = eth_irq_acknowledge();
-    assert(!error);
+    error = eth_irq_acknowledge();
+    error = lock_unlock();
+}
+
+void hpet_irq_handle(void) {
+    int UNUSED error;
+    error = lock_lock();
+    sys_check_timeouts();
+    timer_handle_irq(hpet_timer, 0);
+    error = hpet_irq_acknowledge();
+    error = lock_unlock();
 }
 
 static lwip_iface_t *init_eth(int iospace_id, int bus, int dev, int fun) {
-    int error;
+    int UNUSED error;
     int pci_bdf = bus * 256 + dev * 8 + fun;
     ps_io_ops_t ioops;
 
-    assert(!error);
 #ifdef CONFIG_IOMMU
     cspacepath_t iospace;
     error = vka_cspace_alloc_path(&vka, &iospace);
@@ -164,47 +181,6 @@ static lwip_iface_t *init_eth(int iospace_id, int bus, int dev, int fun) {
     return lwip;
 }
 
-static struct netif *init_interface(lwip_iface_t *lwip, const char *ip_str, const char *nm_str, const char *gw_str) {
-    struct ip_addr ip, nm, gw;
-
-    int err = 0;
-    err |= !ipaddr_aton(ip_str, &ip);
-    err |= !ipaddr_aton(nm_str, &nm);
-    err |= !ipaddr_aton(gw_str, &gw);
-
-    if (err) {
-        return NULL;
-    }
-
-    struct netif *netif = malloc(sizeof(*netif));
-
-    lwip->netif = netif_add(netif, &ip, &nm, &gw, lwip, ethif_get_ethif_init(lwip), ethernet_input);
-
-    assert(lwip->netif != NULL);
-    netif_set_up(lwip->netif);
-    netif_set_default(lwip->netif);
-
-    return netif;
-}
-
-static void test_udp(const char *dest_ip_str, struct udp_pcb *udp_conn, int port, const char *msg) {
-    err_t err;
-    struct ip_addr dst;
-    ipaddr_aton(dest_ip_str, &dst);
-
-    int len = strlen(msg);
-    struct pbuf *pbuf = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
-    assert(pbuf);
-
-    printf("Attempting to send %d bytes to %s\n", len, dest_ip_str);
-
-    memcpy(pbuf->payload, msg, len);
-    err = udp_sendto(udp_conn, pbuf, &dst, port);
-    assert(err == ERR_OK);
-
-    pbuf_free(pbuf);
-}
-
 void udp_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p, ip_addr_t *ip, u16_t port) {
     printf("Received udp packet of %d bytes from %s:%d\n", p->len, ipaddr_ntoa(ip), port);
     char *data = malloc(p->len + 1);
@@ -213,37 +189,68 @@ void udp_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p, ip_addr_t
 
     printf("Data: %s\n", data);
     free(data);
+    /* send the data back */
+    udp_sendto(pcb, p, ip, port);
     pbuf_free(p);
 }
 
-int run() {
+void netif_link_callback(struct netif *netif) {
+    if (netif_is_link_up(netif)) {
+        int err;
+        printf("Link is up\n");
+        printf("IPADDR is %s\n", ipaddr_ntoa(&netif->ip_addr));
+        struct udp_pcb *udp_conn = udp_new();
+        ZF_LOGF_IF(!udp_conn, "Failed to create udp connection");
 
+        err = udp_bind(udp_conn, IP_ADDR_ANY, 7);
+        ZF_LOGF_IF(err != ERR_OK, "Failed to bind port 7");
+        udp_recv(udp_conn, udp_recv_callback, NULL);
+    }
+}
+
+static struct netif *init_interface(lwip_iface_t *lwip) {
+    struct netif *netif = malloc(sizeof(*netif));
+    err_t err;
+
+    lwip->netif = netif_add(netif, NULL, NULL, NULL, lwip, ethif_get_ethif_init(lwip), ethernet_input);
+
+    assert(lwip->netif != NULL);
+    netif_set_default(lwip->netif);
+    netif_set_status_callback(lwip->netif, netif_link_callback);
+    err = dhcp_start(lwip->netif);
+    ZF_LOGF_IF(err != ERR_OK, "Failed to start dhcp");
+
+    return netif;
+}
+
+void init_timers(void) {
+    hpet_config_t config = (hpet_config_t){hpet_mmio, 1 + IRQ_OFFSET, 0};
+    hpet_timer = hpet_get_timer(&config);
+    ZF_LOGF_IF(!hpet_timer, "Failed to get HPET timer");
+    tsc_timer = tsc_get_timer(hpet_timer);
+    ZF_LOGF_IF(!tsc_timer, "Failed to get TSC timer");
+    /* configure the hpet timer for periodic timeout */
+    timer_start(hpet_timer);
+    timer_periodic(hpet_timer, NS_IN_MS * 100);
+}
+
+u32_t sys_now(void) {
+    return timer_get_time(tsc_timer) / NS_IN_MS;
+}
+
+void pre_init() {
+    int bus, dev, fun;
     init_env();
-    lwip_iface_t *lwip = init_eth(0x12, 6, 0, 0);
 
+    printf("Initializing timers\n");
+    init_timers();
+    sscanf(pci_bdf, "%x:%x.%d", &bus, &dev, &fun);
+    lwip_iface_t *lwip = init_eth(iospace_id, bus, dev, fun);
     printf("Initializing lwip\n");
     lwip_init();
 
     printf("Creating interface\n");
-    struct netif *netif = init_interface(lwip, "192.168.0.2", "255.255.255.0", "192.168.0.1");
+    struct UNUSED netif *netif = init_interface(lwip);
     assert(netif);
-
-    struct udp_pcb *udp_conn = udp_new();
-    assert(udp_conn);
-
-    udp_recv(udp_conn, udp_recv_callback, NULL);
-
-    char buf[128];
-
-    unsigned int count = 0;
-    for (int j = 0; j < 10; j++) {
-        for (volatile int i = 0; i < 1000000000; i++);
-        snprintf(buf, 128, "[%d] Hello, World!\n", count);
-        test_udp("192.168.0.1", udp_conn, 1234, buf);
-        count++;
-    }
-
-    udp_remove(udp_conn);
-
-    return 0;
+    printf("Waiting for DHCP\n");
 }
