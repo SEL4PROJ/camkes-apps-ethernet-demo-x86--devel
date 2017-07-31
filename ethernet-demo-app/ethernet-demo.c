@@ -45,6 +45,7 @@
 
 #define RX_BUFS 256
 #define BUF_SIZE 2048
+#define PERIOD (NS_IN_MS * 100)
 
 static simple_t camkes_simple;
 static vka_t vka;
@@ -54,8 +55,8 @@ static char allocator_mempool[0x4000];
 static lwip_iface_t _lwip;
 static seL4_CPtr (*original_vspace_get_cap)(vspace_t*, void*);
 static sel4utils_alloc_data_t vspace_data;
-static pstimer_t *hpet_timer = NULL;
-static pstimer_t *tsc_timer = NULL;
+static hpet_t hpet;
+static uint64_t tsc_freq = 0;
 
 void camkes_make_simple(simple_t *simple);
 
@@ -133,7 +134,7 @@ void hpet_irq_handle(void) {
     int UNUSED error;
     error = lock_lock();
     sys_check_timeouts();
-    timer_handle_irq(hpet_timer, 0);
+    hpet_set_timeout(&hpet, (hpet_get_time(&hpet) + PERIOD));
     error = hpet_irq_acknowledge();
     error = lock_unlock();
 }
@@ -226,17 +227,18 @@ static struct netif *init_interface(lwip_iface_t *lwip) {
 
 void init_timers(void) {
     hpet_config_t config = (hpet_config_t){hpet_mmio, 1 + IRQ_OFFSET, 0};
-    hpet_timer = hpet_get_timer(&config);
-    ZF_LOGF_IF(!hpet_timer, "Failed to get HPET timer");
-    tsc_timer = tsc_get_timer(hpet_timer);
-    ZF_LOGF_IF(!tsc_timer, "Failed to get TSC timer");
+    int error = hpet_init(&hpet, config);
+    ZF_LOGF_IF(error, "Failed to get HPET timer");
+
+    hpet_start(&hpet);
+    tsc_freq = tsc_calculate_frequency_hpet(&hpet);
     /* configure the hpet timer for periodic timeout */
-    timer_start(hpet_timer);
-    timer_periodic(hpet_timer, NS_IN_MS * 100);
+    error = hpet_set_timeout(&hpet, (hpet_get_time(&hpet) + PERIOD));
+    ZF_LOGF_IF(error, "Failed to set timeout");
 }
 
 u32_t sys_now(void) {
-    return timer_get_time(tsc_timer) / NS_IN_MS;
+    return tsc_get_time(tsc_freq) / NS_IN_MS;
 }
 
 void pre_init() {
